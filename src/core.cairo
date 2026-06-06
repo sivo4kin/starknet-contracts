@@ -21,7 +21,6 @@ pub mod Core {
     use crate::math::bitmap::{
         Bitmap, BitmapTrait, tick_to_word_and_bit_index, word_and_bit_index_to_tick,
     };
-    use crate::math::fee::{accumulate_fee_amount, compute_fee};
     use crate::math::liquidity::liquidity_delta_to_amount_delta;
     use crate::math::swap::{is_price_increasing, swap_result};
     use crate::math::ticks::{
@@ -34,7 +33,7 @@ pub mod Core {
         FeesPerLiquidity, fees_per_liquidity_from_amount0, fees_per_liquidity_from_amount1,
         fees_per_liquidity_new,
     };
-    use crate::types::i129::{AddDeltaTrait, i129, i129Trait};
+    use crate::types::i129::{AddDeltaTrait, i129};
     use crate::types::keys::{PoolKey, PoolKeyTrait, PositionKey, SavedBalanceKey};
     use crate::types::pool_price::PoolPrice;
     use crate::types::position::{Position, PositionTrait};
@@ -50,8 +49,10 @@ pub mod Core {
 
     #[storage]
     pub struct Storage {
-        // withdrawal fees collected, controlled by the owner
+        // protocol fees collected, controlled by the owner
         pub protocol_fees_collected: Map<ContractAddress, u128>,
+        // legacy no-op protocol fee slot kept for backward storage compatibility
+        pub core_protocol_fee: u128,
         // transient state of the lockers, which always starts and ends at zero
         pub lock_count: u32,
         pub locker_token_deltas: Map<(u32, ContractAddress), i129>,
@@ -88,13 +89,6 @@ pub mod Core {
         pub recipient: ContractAddress,
         pub token: ContractAddress,
         pub amount: u128,
-    }
-
-    #[derive(starknet::Event, Drop)]
-    pub struct ProtocolFeesPaid {
-        pub pool_key: PoolKey,
-        pub position_key: PositionKey,
-        pub delta: Delta,
     }
 
     #[derive(starknet::Event, Drop)]
@@ -150,12 +144,17 @@ pub mod Core {
     }
 
     #[derive(starknet::Event, Drop)]
+    pub struct ExtensionCallPointsSet {
+        pub extension: ContractAddress,
+        pub call_points: CallPoints,
+    }
+
+    #[derive(starknet::Event, Drop)]
     #[event]
     enum Event {
         #[flat]
         UpgradeableEvent: upgradeable_component::Event,
         OwnedEvent: owned_component::Event,
-        ProtocolFeesPaid: ProtocolFeesPaid,
         ProtocolFeesWithdrawn: ProtocolFeesWithdrawn,
         PoolInitialized: PoolInitialized,
         PositionUpdated: PositionUpdated,
@@ -164,6 +163,7 @@ pub mod Core {
         SavedBalance: SavedBalance,
         LoadedBalance: LoadedBalance,
         FeesAccumulated: FeesAccumulated,
+        ExtensionCallPointsSet: ExtensionCallPointsSet,
     }
 
     #[generate_trait]
@@ -398,6 +398,10 @@ pub mod Core {
             self.protocol_fees_collected.read(token)
         }
 
+        fn get_core_protocol_fee(self: @ContractState) -> u128 {
+            0
+        }
+
         fn get_locker_state(self: @ContractState, id: u32) -> LockerState {
             let address = self.get_locker_address(id);
             let nonzero_delta_count = self.get_nonzero_delta_count(id);
@@ -507,6 +511,10 @@ pub mod Core {
                 'TOKEN_TRANSFER_FAILED',
             );
             self.emit(ProtocolFeesWithdrawn { recipient, token, amount });
+        }
+
+        fn clear_core_protocol_fee(ref self: ContractState) {
+            self.core_protocol_fee.write(0);
         }
 
         fn lock(ref self: ContractState, data: Span<felt252>) -> Span<felt252> {
@@ -707,7 +715,7 @@ pub mod Core {
             );
 
             // compute the amount deltas due to the liquidity delta
-            let mut delta = liquidity_delta_to_amount_delta(
+            let delta = liquidity_delta_to_amount_delta(
                 price.sqrt_ratio, params.liquidity_delta, sqrt_ratio_lower, sqrt_ratio_upper,
             );
 
@@ -716,40 +724,7 @@ pub mod Core {
                 owner: locker, salt: params.salt, bounds: params.bounds,
             };
 
-            // account the withdrawal protocol fee, because it's based on the deltas
-            if (params.liquidity_delta.is_negative()) {
-                let amount0_fee = compute_fee(delta.amount0.mag, pool_key.fee);
-                let amount1_fee = compute_fee(delta.amount1.mag, pool_key.fee);
-
-                let withdrawal_fee_delta = Delta {
-                    amount0: i129 { mag: amount0_fee, sign: true },
-                    amount1: i129 { mag: amount1_fee, sign: true },
-                };
-
-                if (amount0_fee.is_non_zero()) {
-                    self
-                        .protocol_fees_collected
-                        .write(
-                            pool_key.token0,
-                            accumulate_fee_amount(
-                                self.protocol_fees_collected.read(pool_key.token0), amount0_fee,
-                            ),
-                        );
-                }
-                if (amount1_fee.is_non_zero()) {
-                    self
-                        .protocol_fees_collected
-                        .write(
-                            pool_key.token1,
-                            accumulate_fee_amount(
-                                self.protocol_fees_collected.read(pool_key.token1), amount1_fee,
-                            ),
-                        );
-                }
-
-                delta -= withdrawal_fee_delta;
-                self.emit(ProtocolFeesPaid { pool_key, position_key, delta: withdrawal_fee_delta });
-            }
+            // no withdrawal protocol fee charged on liquidity removal
 
             let get_position_result = self.get_position_with_fees(pool_key, position_key);
 
@@ -1084,7 +1059,12 @@ pub mod Core {
 
         fn set_call_points(ref self: ContractState, call_points: CallPoints) {
             assert(call_points != Default::default(), 'INVALID_CALL_POINTS');
-            self.extension_call_points.write(get_caller_address(), call_points);
+            let extension = get_caller_address();
+            let existing_call_points = self.extension_call_points.read(extension);
+            self.extension_call_points.write(extension, call_points);
+            if existing_call_points != call_points {
+                self.emit(ExtensionCallPointsSet { extension, call_points });
+            }
         }
 
         // Returns the call points for the given extension.

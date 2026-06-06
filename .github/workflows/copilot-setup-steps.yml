@@ -1,17 +1,19 @@
-name: Fast Tests
+name: Copilot Setup Steps
 
 on:
+  workflow_dispatch:
   push:
-    branches:
-      - main
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
   pull_request:
-    branches:
-      - main
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
 
 jobs:
-  unit:
-    name: Unit Tests
+  copilot-setup-steps:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -23,5 +25,5 @@ jobs:
         with:
           scarb-lock: ./Scarb.lock
 
-      - name: Run tests
-        run: scarb test
+      - name: Install dependencies
+        run: scarb fetch

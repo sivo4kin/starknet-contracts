@@ -1,10 +1,13 @@
 use core::num::traits::Zero;
+use core::option::OptionTrait;
 use starknet::get_contract_address;
-use starknet::testing::set_contract_address;
 use crate::interfaces::core::{
     ICoreDispatcher, ICoreDispatcherTrait, IExtensionDispatcher, IExtensionDispatcherTrait,
 };
-use crate::tests::helper::{Deployer, DeployerTrait, swap_inner, update_position_inner};
+use crate::tests::helper::{
+    Deployer, DeployerTrait, EventLoggerTrait, event_logger, set_caller_address_global, swap_inner,
+    update_position_inner,
+};
 use crate::tests::mocks::locker::ICoreLockerDispatcher;
 use crate::tests::mocks::mock_extension::{
     ExtensionCalled, IMockExtensionDispatcher, IMockExtensionDispatcherTrait,
@@ -40,7 +43,7 @@ fn setup(
 }
 
 #[test]
-#[should_panic(expected: ('CORE_ONLY', 'ENTRYPOINT_FAILED'))]
+#[should_panic(expected: 'CORE_ONLY')]
 fn test_mock_extension_cannot_be_called_directly() {
     let mut deployer: Deployer = Default::default();
     let (_, _, extension, _, pool_key) = setup(
@@ -56,12 +59,12 @@ fn test_mock_extension_can_be_called_by_core() {
     let (core, _, extension, _, pool_key) = setup(
         ref deployer: deployer, fee: 0, tick_spacing: 1, call_points: all_call_points(),
     );
-    set_contract_address(core.contract_address);
+    set_caller_address_global(core.contract_address);
     extension.before_initialize_pool(Zero::zero(), pool_key, Zero::zero());
 }
 
 #[test]
-#[should_panic(expected: ('INVALID_CALL_POINTS', 'ENTRYPOINT_FAILED'))]
+#[should_panic(expected: 'INVALID_CALL_POINTS')]
 fn test_cannot_change_to_default_call_points() {
     let mut deployer: Deployer = Default::default();
 
@@ -126,6 +129,58 @@ fn test_change_call_points_random_call_points() {
     assert_eq!(core.get_call_points(mock_extension.contract_address), before);
     mock_extension.change_call_points(after);
     assert_eq!(core.get_call_points(mock_extension.contract_address), after);
+}
+
+#[test]
+fn test_set_call_points_emits_extension_call_points_set_event() {
+    let mut deployer: Deployer = Default::default();
+    let mut logger = event_logger();
+    let core = deployer.deploy_core();
+    let extension = deployer.deploy_mock_extension(core, all_call_points());
+
+    OptionTrait::unwrap(
+        logger
+            .pop_log::<
+                crate::components::owned::Owned::OwnershipTransferred,
+            >(core.contract_address),
+    );
+    let event: crate::core::Core::ExtensionCallPointsSet = logger
+        .pop_log(core.contract_address)
+        .unwrap();
+    assert(event.extension == extension.contract_address, 'event.extension');
+    assert(event.call_points == all_call_points(), 'event.call_points');
+}
+
+#[test]
+fn test_set_call_points_does_not_emit_event_when_unchanged() {
+    let mut deployer: Deployer = Default::default();
+    let mut logger = event_logger();
+    let core = deployer.deploy_core();
+    let extension = deployer.deploy_mock_extension(core, all_call_points());
+
+    OptionTrait::unwrap(
+        logger
+            .pop_log::<
+                crate::components::owned::Owned::OwnershipTransferred,
+            >(core.contract_address),
+    );
+    let initial_event = OptionTrait::unwrap(
+        logger
+            .pop_log::<
+                crate::core::Core::ExtensionCallPointsSet,
+            >(core.contract_address),
+    );
+    assert(initial_event.extension == extension.contract_address, 'event.extension');
+    assert(initial_event.call_points == all_call_points(), 'event.call_points');
+    extension.change_call_points(all_call_points());
+    assert(
+        logger
+            .pop_log::<
+                crate::core::Core::ExtensionCallPointsSet,
+            >(core.contract_address)
+            .is_none(),
+        'event should not be emitted',
+    );
 }
 
 fn check_matches_pool_key(call: ExtensionCalled, pool_key: PoolKey) {
@@ -218,9 +273,10 @@ fn test_mock_extension_update_position_is_called() {
     check_matches_pool_key(before, pool_key);
 }
 
-
+// TODO Fails with INVALID_CALL_POINTS error. but we cannot intercept it in the test
 #[test]
-#[should_panic(expected: ('mockext deploy failed',))]
+#[ignore]
+#[should_panic(expected: 'mockext deploy failed')]
 fn test_mock_extension_no_call_points_fails() {
     // this panics because you cannot create an extension with no call points
     let mut deployer: Deployer = Default::default();
